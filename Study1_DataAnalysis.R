@@ -8,12 +8,15 @@
 #   (2) reshapes it to one row per participant x secret-category,
 #   (3) caps statistical outliers on the hide/think measures,
 #   (4) builds composite outcome variables,
-#   (5) fits mixed-effects models with crossed random effects, and
-#   (6) runs a bootstrap mediation (hide/think -> task/relationship -> work).
+#   (5) fits mixed-effects models with crossed random effects,
+#   (6) runs a bootstrap mediation (hide/think -> task/relationship -> work), and
+#   (7) runs additional interaction, simple-slopes, and control-variable models
+#       (Sections 11-13) merged in from Study1_DataAnalysisE.R.
 #
-# NOTE: This file only adds comments/section headers for readability.
-#       All code logic, variable names, paths, formulas, and outputs are
-#       unchanged from the original analysis.
+# NOTE: Sections 1-10 are the original analysis with comments added for
+#       readability (code, variable names, paths, formulas, and outputs
+#       unchanged). The age mean/SD in Section 2 and Sections 11-13 were MERGED
+#       IN from Study1_DataAnalysisE.R; that code is preserved verbatim.
 # =============================================================================
 
 
@@ -43,6 +46,10 @@ ck <- ck[is.na(ck$honesty) | as.numeric(as.character(ck$honesty)) != 2, ]  # 2 =
 # Frequency tables describing the sample composition (gender and age).
 # demographics
 table(ck$gender); table(as.numeric(as.character(ck$age)));
+
+# Mean and SD of participant age (merged from Study1_DataAnalysisE.R).
+mean(as.numeric(ck$age), na.rm=TRUE)
+sd(as.numeric(ck$age), na.rm=TRUE)
 
 head(ck)
 
@@ -338,3 +345,79 @@ head(th.)
 # Final model: does the rating differ between think. and hide. (think1hide0),
 # with crossed random intercepts for participant and category?
 summary(lmer(avg.rating ~ think1hide0+ (1|ResponseId) + (1|X1), th.))
+
+
+# =============================================================================
+# 11. THINK x HIDE INTERACTION MODELS        (merged from Study1_DataAnalysisE.R)
+# =============================================================================
+
+# Section 8 entered think. and hide. additively. These models add their
+# INTERACTION (think. * hide.) to test whether the effect of one depends on the
+# level of the other, still controlling for the other outcome and using the same
+# crossed random effects. (The "++" is a harmless stray unary plus from the
+# original code and is kept verbatim.)
+summary(lmer(relationship~hide.*think.+task++(1|ResponseId)+(1|X1),cm.))
+summary(lmer(task~hide.*think.+relationship++(1|ResponseId)+(1|X1),cm.))
+
+
+# =============================================================================
+# 12. SIMPLE-SLOPES / SPOTLIGHT ANALYSIS     (merged from Study1_DataAnalysisE.R)
+# =============================================================================
+
+# Probe the think. x hide. interaction. First standardize (z-score) both
+# predictors, then build shifted copies at +/- 1 SD: re-centering a predictor so
+# that its high/low value sits at 0 makes the interaction model's main term
+# report the SIMPLE SLOPE of the other predictor at that level.
+# (Naming follows the original: ".high" subtracts 1 SD, ".low" adds 1 SD.)
+cm.$think.c<-scale(cm.$think.)
+cm.$hide.c<-scale(cm.$hide.)
+mean(cm.$think.c,na.rm=T)   # ~0 after centering (sanity check)
+mean(cm.$hide.c,na.rm=T)
+think.high<-cm.$think.c-sd(cm.$think.c,na.rm=T)   # re-centered at +1 SD ("high")
+think.low<-cm.$think.c+sd(cm.$think.c,na.rm=T)    # re-centered at -1 SD ("low")
+hide.high<-cm.$hide.c-sd(cm.$hide.c,na.rm=T)
+hide.low<-cm.$hide.c+sd(cm.$hide.c,na.rm=T)
+
+# Centered interaction, then the simple slope of think.c at low/high hide,
+# and of hide.c at low/high think.
+summary(lmer(relationship~hide.c*think.c+task++(1|ResponseId)+(1|X1),cm.))
+summary(lmer(relationship~hide.low*think.c+task++(1|ResponseId)+(1|X1),cm.))
+summary(lmer(relationship~hide.high*think.c+task++(1|ResponseId)+(1|X1),cm.))
+
+summary(lmer(relationship~hide.c*think.low+task++(1|ResponseId)+(1|X1),cm.))
+summary(lmer(relationship~hide.c*think.high+task++(1|ResponseId)+(1|X1),cm.))
+
+
+# =============================================================================
+# 13. CONTROL VARIABLES — TENURE & TEAM SIZE (merged from Study1_DataAnalysisE.R)
+# =============================================================================
+
+# Robustness check: do the think./hide. effects vary with job tenure and team
+# size? These two controls live at the PARTICIPANT level (in ck), so they are
+# converted to numeric and merged into cm. by ResponseId before being used as
+# moderators. (This merge runs last so the Section 9-10 analyses above, which
+# rely on cm.'s original structure, are unaffected.)
+
+# Convert tenure and team_size to numeric in the original participant-level dataset
+ck$tenure <- as.numeric(as.character(ck$tenure))
+ck$team_size <- as.numeric(as.character(ck$team_size))
+
+# Keep one row per participant with their tenure and team size
+control_df <- unique(ck[, c("ResponseId", "tenure", "team_size")])
+
+# Remove old control variables from cm. if they were already merged before
+cm. <- cm.[, !names(cm.) %in% c(
+  "tenure", "tenure.x", "tenure.y",
+  "team_size", "team_size.x", "team_size.y"
+)]
+
+# Merge tenure and team_size into cm. by ResponseId
+cm. <- merge(cm., control_df, by = "ResponseId", all.x = TRUE)
+
+# think./hide. x tenure interactions (each controlling for the other outcome)...
+summary(lmer(task ~ think. * tenure + hide. * tenure + relationship +  (1 | ResponseId) + (1 | X1), cm.))
+summary(lmer(relationship ~ think. * tenure + hide. * tenure + task +  (1 | ResponseId) + (1 | X1), cm.))
+
+# ...and think./hide. x team_size interactions.
+summary(lmer(task ~ think. * team_size + hide. * team_size + relationship +  (1 | ResponseId) + (1 | X1), cm.))
+summary(lmer(relationship ~ think. * team_size + hide. * team_size + task +  (1 | ResponseId) + (1 | X1), cm.))
