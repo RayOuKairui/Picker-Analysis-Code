@@ -1,9 +1,27 @@
-library(readr)
-library(dplyr)
-library(stringr)
-library(httr2)
-library(jsonlite)
-library(openxlsx)
+# =============================================================================
+# CROSS-CODEBOOK COMPARISON — Not Told vs. Not Heard themes
+# -----------------------------------------------------------------------------
+# Takes the two inductively-built theme codebooks (one for the "not told" secrets
+# and one for the "not heard" secrets) and asks Gemini to decide which themes are
+# CONCEPTUALLY COMMON across the two sides and which are UNIQUE to one side, then
+# writes the comparison to a multi-sheet Excel workbook.
+#
+# Inputs : stage2_code_to_nottoldtheme_map.csv      (Not Told codebook)
+#          stage2_code_to_notheartheme_map_v2.csv   (Not Heard codebook)
+# Output : themes_common_vs_unique.xlsx
+#
+# NOTE: Comments/section headers were added for readability. The only content
+#       change is a correction to the NOT TOLD question wording in the prompt
+#       (see Stage "Prompt" below) to the confirmed-correct framing.
+# =============================================================================
+
+# ---- Packages ----
+library(readr)     # read_csv() — load the two codebook CSVs
+library(dplyr)     # bind_rows(), tibble(), %>% for assembling result tables
+library(stringr)   # string helpers
+library(httr2)     # HTTP client for the Gemini API call
+library(jsonlite)  # fromJSON() — parse the model's JSON response
+library(openxlsx)  # createWorkbook()/writeData()/saveWorkbook() — Excel output
 
 # ---- Setup ----
 api_key  <- Sys.getenv("GEMINI_API_KEY")
@@ -16,23 +34,26 @@ nottold_summary  <- "stage2_code_to_nottoldtheme_map.csv"
 notheard_summary <- "stage2_code_to_notheartheme_map_v2.csv"
 output_excel     <- "themes_common_vs_unique.xlsx"
 
-# ---- Load both theme codebooks ----
+# ---- Load both theme codebooks (each: open_code -> theme, with definitions) ----
 nottold  <- read_csv(nottold_summary,  locale = locale(encoding = "UTF-8"))
 notheard <- read_csv(notheard_summary, locale = locale(encoding = "UTF-8"))
 
 cat("Not Told themes: ", nrow(nottold),  "\n")
 cat("Not Heard themes:", nrow(notheard), "\n")
 
+# Helper: render a codebook as a labeled "- theme: definition" block for the prompt.
 fmt <- function(df, label) {
   paste0("=== ", label, " ===\n",
          paste0("- ", df$theme, ": ", df$definition, collapse = "\n"))
 }
 
 # ---- Prompt ----
+# Instructs the model to match themes by CONTENT (not literal name), classify each
+# into common-vs-unique, and return strict JSON. Both codebooks are appended.
 prompt <- paste0(
   "You are a qualitative researcher comparing two thematic codebooks from a ",
   "single study. The same participants answered two questions:\n",
-  "1. NOT TOLD: \"What is a secret you have NOT TOLD anyone at work?\"\n",
+  "1. NOT TOLD: \"What is a secret you told someone at work, even though you weren't supposed to?\"\n",
   "2. NOT HEARD: \"What is a secret someone TOLD YOU at work that you wish ",
   "they hadn't?\"\n\n",
   "Each side was inductively themed separately, so equivalent content may ",
@@ -60,7 +81,7 @@ prompt <- paste0(
   fmt(notheard, "NOT HEARD CODEBOOK")
 )
 
-# ---- Gemini call ----
+# ---- Gemini call (single request; low temperature, JSON-only, with retries) ----
 body <- list(
   contents = list(list(parts = list(list(text = prompt)))),
   generationConfig = list(
@@ -78,13 +99,17 @@ resp <- request(endpoint) |>
   req_timeout(180) |>
   req_perform()
 
+# Extract and parse the JSON text the model returned.
 parsed <- resp |> resp_body_json()
 txt    <- parsed$candidates[[1]]$content$parts[[1]]$text
 out    <- fromJSON(txt, simplifyDataFrame = FALSE)
 cat("Finish reason:", parsed$candidates[[1]]$finishReason, "\n")
 
+# Replace any NULL JSON field with "" so the tibbles below stay rectangular.
 null_safe <- function(x) if (is.null(x)) "" else x
 
+# ---- Assemble result tables from the parsed JSON ----
+# Common themes: matched pairs across the two codebooks.
 common_df <- bind_rows(lapply(out$common, function(r) tibble(
   content_area    = null_safe(r$content_area),
   not_told_theme  = null_safe(r$not_told_theme),
@@ -92,17 +117,19 @@ common_df <- bind_rows(lapply(out$common, function(r) tibble(
   note            = null_safe(r$note)
 )))
 
+# Themes unique to the Not Told side.
 unique_nottold_df <- bind_rows(lapply(out$unique_to_not_told, function(r) tibble(
   theme = null_safe(r$theme),
   note  = null_safe(r$note)
 )))
 
+# Themes unique to the Not Heard side.
 unique_notheard_df <- bind_rows(lapply(out$unique_to_not_heard, function(r) tibble(
   theme = null_safe(r$theme),
   note  = null_safe(r$note)
 )))
 
-# ---- Coverage check: did every theme make it into the output? ----
+# ---- Coverage check: did every input theme make it into the output? ----
 all_returned <- c(common_df$not_told_theme, common_df$not_heard_theme,
                   unique_nottold_df$theme, unique_notheard_df$theme)
 all_returned <- all_returned[all_returned != ""]
@@ -120,11 +147,12 @@ if (length(missing) > 0) {
   cat("All themes accounted for.\n")
 }
 
+# Print the three result tables to the console.
 cat("\n=== Common ===\n");           print(common_df)
 cat("\n=== Unique to Not Told ===\n"); print(unique_nottold_df)
 cat("\n=== Unique to Not Heard ===\n"); print(unique_notheard_df)
 
-# ---- Excel output ----
+# ---- Excel output: one sheet per result table, plus both source codebooks ----
 wb <- createWorkbook()
 addWorksheet(wb, "Common Themes")
 writeData(wb, "Common Themes", common_df)

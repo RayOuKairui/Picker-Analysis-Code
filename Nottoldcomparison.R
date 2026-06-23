@@ -1,9 +1,29 @@
-library(readr)
-library(dplyr)
-library(stringr)
-library(httr2)
-library(jsonlite)
-library(openxlsx)
+# =============================================================================
+# NOT-TOLD SECRETS — DEDUCTIVE CLASSIFICATION INTO PREDEFINED CATEGORIES
+# -----------------------------------------------------------------------------
+# Mirror of Nothearcomparison.R for the "not told" secrets. Classifies each
+# response into a FIXED set of 20 predefined categories (from Category_wording.docx),
+# then mines the leftovers for possible new categories.
+#
+#   Stage A : assign every response to exactly one of the 20 categories, or to
+#             "NOT-FIT-IN" / "N/A"                         (gemini-2.5-flash)
+#   Stage B : read all NOT-FIT-IN responses and propose 1-5 brand-new categories
+#
+# Inputs : secretsnottold_long_form_sorted.csv
+# Outputs: nottold_coded.csv            (every response + assigned category)
+#          nottold_classification.xlsx  (coded data, frequencies, unfit, proposals)
+#
+# NOTE: Comments/section headers were added for readability. All code logic,
+#       variable names, file paths, prompts, and outputs are unchanged.
+# =============================================================================
+
+# ---- Packages ----
+library(readr)     # read_csv()/write_csv() — CSV I/O
+library(dplyr)     # data wrangling (mutate/filter/join/count, %>%)
+library(stringr)   # str_trim()/str_replace_all() — clean response text
+library(httr2)     # Gemini API HTTP client
+library(jsonlite)  # parse the model's JSON responses
+library(openxlsx)  # write the multi-sheet Excel workbook
 
 # ---- Setup ----
 api_key  <- Sys.getenv("GEMINI_API_KEY")
@@ -11,7 +31,7 @@ model    <- "gemini-2.5-flash"
 endpoint <- paste0("https://generativelanguage.googleapis.com/v1beta/models/",
                    model, ":generateContent")
 
-# ---- The 20 categories from Category_wording.docx ----
+# ---- The 20 categories from Category_wording.docx (name + definition) ----
 categories <- tribble(
   ~name, ~definition,
   "Salary and Pay",                                 "Pay levels, salary ranges, or pay differences between employees",
@@ -35,11 +55,14 @@ categories <- tribble(
   "Hidden Rules and Workarounds",                   "Informal rules, policy exceptions, misrepresenting time worked, shortcuts, or undocumented practices",
   "Misconduct and Compliance Issues",               "Theft, fraud, misuse of resources, legal, or compliance problems"
 )
+# Render the categories as a prompt block, and the allowed label set for validation.
 categories_block <- paste0("- ", categories$name, ": ", categories$definition,
                            collapse = "\n")
 valid_labels <- c(categories$name, "NOT-FIT-IN", "N/A")
 
 # ---- Load and prep responses ----
+# Add a stable row id, a cleaned response string, and pre-classify obvious N/A
+# rows so they never reach the API.
 df <- read_csv("secretsnottold_long_form_sorted.csv",
                locale = locale(encoding = "UTF-8")) %>%
   mutate(
@@ -56,7 +79,7 @@ to_code <- df %>% filter(is.na(pre_category))
 cat("Total rows:", nrow(df), "| Pre-classified N/A:", sum(!is.na(df$pre_category)),
     "| Sending to API:", nrow(to_code), "\n")
 
-# ---- Gemini helper ----
+# ---- Gemini helper (returns parsed JSON + finish reason) ----
 gemini_json <- function(prompt, max_tokens = 8192) {
   body <- list(
     contents = list(list(parts = list(list(text = prompt)))),
@@ -79,7 +102,9 @@ gemini_json <- function(prompt, max_tokens = 8192) {
        finish = parsed$candidates[[1]]$finishReason)
 }
 
-# ---- Stage A: classify in batches, with resume support ----
+# ---- Stage A: classify in batches of 20, with resume support ----
+# Already-coded rows are skipped via the progress file so an interrupted run can
+# resume; each response is forced to exactly one valid label.
 progress_file <- "nottold_coded_progress.csv"
 done_uids <- if (file.exists(progress_file)) read_csv(progress_file)$row_uid else integer(0)
 queue <- to_code %>% filter(!row_uid %in% done_uids)
@@ -91,7 +116,7 @@ for (b_idx in seq_along(batches)) {
   batch <- batches[[b_idx]]
   items_block <- paste0("[", batch$row_uid, "] ", batch$response_clean,
                         collapse = "\n")
-  
+
   prompt <- paste0(
     "You are a qualitative researcher classifying workplace secrets into ",
     "predefined categories. For each response below, assign EXACTLY ONE label.\n\n",
@@ -108,7 +133,8 @@ for (b_idx in seq_along(batches)) {
     '{"results": [{"id": 123, "category": "..."}]}\n\n',
     "Responses:\n", items_block
   )
-  
+
+  # On any API error, fall back to an empty result set for this batch.
   res <- tryCatch(
     gemini_json(prompt, 8192),
     error = function(e) list(
@@ -116,20 +142,21 @@ for (b_idx in seq_along(batches)) {
       finish = paste0("ERROR: ", conditionMessage(e))
     )
   )
-  
+
   assignments <- bind_rows(lapply(res$json$results, function(a) {
     tibble(row_uid = as.integer(a$id), category = a$category)
   }))
-  
+
   # Validate against the allowed label set
   assignments <- assignments %>%
     mutate(category = if_else(category %in% valid_labels, category, "NOT-FIT-IN"))
-  
+
+  # Any row the model didn't return -> default to NOT-FIT-IN.
   batch_out <- batch %>%
     select(row_uid, ID, response) %>%
     left_join(assignments, by = "row_uid") %>%
     mutate(category = if_else(is.na(category), "NOT-FIT-IN", category))
-  
+
   write_csv(batch_out, progress_file, append = file.exists(progress_file))
   cat("Batch", b_idx, "of", length(batches),
       "(finish:", res$finish, "| n returned:", nrow(assignments), ")\n")
@@ -137,6 +164,8 @@ for (b_idx in seq_along(batches)) {
 }
 
 # ---- Merge API results with pre-classified N/A rows ----
+# coalesce() keeps the pre-classified N/A where present, otherwise the API label,
+# otherwise NOT-FIT-IN.
 api_results <- read_csv(progress_file, locale = locale(encoding = "UTF-8"))
 coded <- df %>%
   select(row_uid, ID, response, pre_category) %>%
@@ -149,7 +178,7 @@ write_csv(coded, "nottold_coded.csv")
 cat("\n=== Stage A Summary ===\n")
 print(coded %>% count(category, sort = TRUE))
 
-# ---- Stage B: analyze NOT-FIT-IN responses for new categories ----
+# ---- Stage B: analyze NOT-FIT-IN responses for possible new categories ----
 not_fit <- coded %>% filter(category == "NOT-FIT-IN") %>%
   mutate(idx = row_number())
 cat("\nNOT-FIT-IN responses to analyze:", nrow(not_fit), "\n")
@@ -162,7 +191,7 @@ if (nrow(not_fit) > 0) {
                           str_replace_all(not_fit$response, "[\r\n]+", " "),
                           collapse = "\n")
   existing_names <- paste(categories$name, collapse = ", ")
-  
+
   analysis_prompt <- paste0(
     "Below are workplace-secret responses that could not be classified into ",
     "any of the existing 24 categories. Your task:\n\n",
@@ -179,29 +208,31 @@ if (nrow(not_fit) > 0) {
     '"rationale": "...", "example_ids": [1, 5, 12]}]}\n\n',
     "Unfit responses:\n", not_fit_block
   )
-  
+
   analysis_res <- gemini_json(analysis_prompt, max_tokens = 16384)
   new_cats <- analysis_res$json$new_categories
-  
+
+  # One row per proposed category (with comma-joined example ids)...
   suggestions_df <- bind_rows(lapply(new_cats, function(c) {
     tibble(proposed_name = c$name,
            definition    = c$definition,
            rationale     = c$rationale,
            example_ids   = paste(unlist(c$example_ids), collapse = ", "))
   }))
-  
+
+  # ...and one row per (category, example response), joined back to the text.
   examples_df <- bind_rows(lapply(new_cats, function(c) {
     tibble(proposed_name = c$name,
            example_id    = as.integer(unlist(c$example_ids)))
   })) %>%
     left_join(not_fit %>% select(idx, ID, response),
               by = c("example_id" = "idx"))
-  
+
   cat("\n=== Proposed New Categories ===\n")
   print(suggestions_df)
 }
 
-# ---- Write everything to Excel ----
+# ---- Write everything to Excel (one sheet per output table) ----
 wb <- createWorkbook()
 addWorksheet(wb, "All Coded Responses")
 writeData(wb, "All Coded Responses", coded)
@@ -213,6 +244,7 @@ addWorksheet(wb, "NOT-FIT-IN Responses")
 writeData(wb, "NOT-FIT-IN Responses",
           not_fit %>% select(ID, response))
 
+# Only add the proposal sheets if Stage B actually returned suggestions.
 if (nrow(suggestions_df) > 0) {
   addWorksheet(wb, "Proposed New Categories")
   writeData(wb, "Proposed New Categories", suggestions_df)
